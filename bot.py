@@ -37,12 +37,16 @@ def get_base_opts() -> dict:
         "no_warnings": True,
         "noplaylist": True,
         "nocheckcertificate": True,
+        "ignoreerrors": False,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web", "ios", "mweb"]},
+            "youtube": {
+                "player_client": ["android", "web", "ios", "mweb"],
+            },
         },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        }
+        },
+        "format_sort": ["asr", "abr", "size"],
     }
     if os.path.exists("cookies.txt"):
         opts["cookiefile"] = "cookies.txt"
@@ -618,9 +622,9 @@ async def on_ig_audio(callback: CallbackQuery):
         print(f"[INFO] Vaqtinchalik video yuklandi: {filepath}")
 
         # 2. Shazam / AudD bilan aniqlash
-        await status.edit_text("🎵 Shazam orqali musiqa qidirilmoqda...")
+        await status.edit_text("🎵 Musiqa qidirilmoqda...")
         music = await recognize_music(filepath)
-        print(f"[INFO] Shazam natijasi: {music}")
+        print(f"Natija: {music}")
 
         if not music:
             # Agar Shazam topmasa, Instagram metadata dan olishga harakat
@@ -636,37 +640,49 @@ async def on_ig_audio(callback: CallbackQuery):
         query = f"{music.get('artist', '')} - {music.get('title', '')}".strip(" -")
         print(f"[INFO] To‘liq qo‘shiq qidirilmoqda: «{query}»")
 
-        await status.edit_text(f"🔍 «{query}» Hozr shu musiqani tashlab beraman 😁")
+        await status.edit_text(f"🔍 «{query}»")
 
         # 3. YouTube dan to‘liq qo‘shiqni yuklash (mavjud on_full_song logikasi)
+                # 3. YouTube dan to‘liq qo‘shiqni yuklash
         opts = get_base_opts()
-        opts["format"] = "bestaudio/best"
-        opts["outtmpl"] = f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s"
-        opts["default_search"] = "ytsearch1"
-        opts["noplaylist"] = True
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+        opts.update({
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s",
+            "default_search": "ytsearch1",
+            "noplaylist": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+
+        print(f"[INFO] YouTube qidiruv: ytsearch1:{query}")
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            if "entries" in info:
+
+            if "entries" in info and info["entries"]:
                 info = info["entries"][0]
+            elif not info:
+                raise Exception("Qo‘shiq topilmadi")
+
             filename = ydl.prepare_filename(info)
             mp3 = os.path.splitext(filename)[0] + ".mp3"
+
             if os.path.exists(mp3):
                 filename = mp3
             else:
                 for f in os.listdir(DOWNLOAD_DIR):
-                    if f.endswith(".mp3") and info.get("id", "") in f:
+                    if f.endswith(".mp3") and (info.get("id", "") in f or "song" in f):
                         filename = os.path.join(DOWNLOAD_DIR, f)
                         break
 
         if not os.path.exists(filename):
-            await status.edit_text("❌ Videoni qayerdan olgansan musiqasini topib bo'lmadiku 😒.")
-            print("Hatolik berdi jigarim afsus topilmadi 😐")
+            await status.edit_text("❌ Videoni qayerdan olgansan, musiqasini topib bo‘lmadi 😒")
+            print("[ERROR] Qo‘shiq fayli topilmadi")
+            if os.path.exists(filepath):
+                os.remove(filepath)
             return
 
         size_mb = round(os.path.getsize(filename) / (1024 * 1024), 1)
@@ -819,21 +835,22 @@ async def on_full_song(callback: CallbackQuery):
     status = await callback.message.answer(f"🔍 «{query}» qidirilmoqda...")
 
     try:
-        # YouTube dan eng yaxshi audio ni qidiramiz
         opts = get_base_opts()
-        opts["format"] = "bestaudio/best"
-        opts["outtmpl"] = f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s"
-        opts["default_search"] = "ytsearch1"
-        opts["noplaylist"] = True
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+        opts.update({
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s",
+            "default_search": "ytsearch1",
+            "noplaylist": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            if "entries" in info:
+            if "entries" in info and info["entries"]:
                 info = info["entries"][0]
 
             filename = ydl.prepare_filename(info)
@@ -856,7 +873,12 @@ async def on_full_song(callback: CallbackQuery):
         await callback.message.answer_audio(
             audio=file,
             title=info.get("title", query),
-            caption=f"✅ <b>{info.get('title', query)}</b>\n🎵 MP3 • {size_mb} MB",
+            caption=(
+                f"💎 <b>{info.get('title', query)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 MP3 • <b>{size_mb} MB</b>\n"
+                f"✨ Premium Audio"
+            ),
             parse_mode=ParseMode.HTML
         )
         await status.delete()
@@ -866,7 +888,8 @@ async def on_full_song(callback: CallbackQuery):
 
     except Exception as e:
         logging.exception(e)
-        await status.edit_text(f"❌ Xatolik: {e}")
+        err_text = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        await status.edit_text(f"❌ Xatolik:\n<code>{err_text}</code>", parse_mode=ParseMode.HTML)
 
 
 async def main():
