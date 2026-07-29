@@ -49,7 +49,10 @@ def get_base_opts() -> dict:
         "format_sort": ["asr", "abr", "size"],
     }
     if os.path.exists("cookies.txt"):
+        print("✅ cookies.txt topildi")
         opts["cookiefile"] = "cookies.txt"
+    else:
+        print("❌ cookies.txt topilmadi")
     return opts
 
 
