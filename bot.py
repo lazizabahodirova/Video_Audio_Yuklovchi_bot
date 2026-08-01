@@ -266,82 +266,544 @@ def download_media(url: str, height: int = None, is_audio: bool = False) -> dict
             "id": info.get("id"),
         }
 
-
 async def recognize_with_shazam(filepath: str) -> dict | None:
-    """Shazam orqali musiqa aniqlash"""
-    audio_path = os.path.join(DOWNLOAD_DIR, f"shazam_{uuid.uuid4().hex[:8]}.mp3")
+    """Videoning turli qismlaridan Shazam orqali musiqa aniqlash"""
+
+    if not os.path.exists(filepath):
+        logging.warning(f"[SHAZAM] Fayl topilmadi: {filepath}")
+        return None
+
+    # ---------------------------------------------------------
+    # VIDEO DAVOMIYLIGINI ANIQLASH
+    # ---------------------------------------------------------
+
+    duration = 0
+
     try:
-        # 20 soniyagacha audio ajratamiz
-        subprocess.run([
-            "ffmpeg", "-y", "-i", filepath,
-            "-vn", "-acodec", "libmp3lame", "-q:a", "4",
-            "-t", "20", audio_path
-        ], check=True, capture_output=True, timeout=60)
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                filepath
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
 
-        shazam = Shazam()
-        result = await shazam.recognize(audio_path)
+        if probe.returncode == 0 and probe.stdout.strip():
+            duration = float(probe.stdout.strip())
 
-        if not result or "track" not in result:
-            return None
-
-        track = result["track"]
-        return {
-            "title": track.get("title", "Noma'lum"),
-            "artist": track.get("subtitle", "Noma'lum"),
-            "url": track.get("url", ""),
-            "image": track.get("images", {}).get("coverarthq") or track.get("images", {}).get("coverart", ""),
-            "source": "shazam"
-        }
     except Exception as e:
-        logging.warning(f"Shazam xatosi: {e}")
-        return None
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+        logging.warning(
+            f"[SHAZAM] Video davomiyligini aniqlab bo'lmadi: {e}"
+        )
 
+    print(f"[SHAZAM] Video davomiyligi: {duration:.1f} sekund")
 
-def recognize_with_audd(filepath: str) -> dict | None:
-    """AudD orqali (zaxira)"""
-    if not AUDD_API_TOKEN:
-        return None
+    # ---------------------------------------------------------
+    # TEKSHIRILADIGAN SEGMENTLAR
+    # ---------------------------------------------------------
 
-    audio_path = os.path.join(DOWNLOAD_DIR, f"audd_{uuid.uuid4().hex[:8]}.mp3")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", filepath,
-            "-vn", "-acodec", "libmp3lame", "-q:a", "5",
-            "-t", "18", audio_path
-        ], check=True, capture_output=True, timeout=60)
+    segments = []
 
-        with open(audio_path, "rb") as f:
-            resp = requests.post(
-                "https://api.audd.io/",
-                data={"api_token": AUDD_API_TOKEN, "return": "apple_music,spotify"},
-                files={"file": f},
-                timeout=30
+    if duration <= 0:
+        segments = [0]
+
+    elif duration <= 20:
+        segments = [0]
+
+    else:
+        # Video boshidan
+        segments.append(0)
+
+        # 5-soniyadan
+        if duration > 25:
+            segments.append(5)
+
+        # 15-soniyadan
+        if duration > 35:
+            segments.append(15)
+
+        # Video o'rtasi
+        middle = max(0, int(duration / 2) - 10)
+        segments.append(middle)
+
+        # Video oxiridan 20 sekund
+        end_start = max(0, int(duration) - 20)
+        segments.append(end_start)
+
+    # Bir xil vaqtlarni olib tashlaymiz
+    segments = sorted(set(segments))
+
+    print(
+        f"[SHAZAM] Tekshiriladigan segmentlar: {segments}"
+    )
+
+    # ---------------------------------------------------------
+    # SHAZAM
+    # ---------------------------------------------------------
+
+    shazam = Shazam()
+
+    for index, start_time in enumerate(segments, start=1):
+
+        audio_path = os.path.join(
+            DOWNLOAD_DIR,
+            f"shazam_{uuid.uuid4().hex[:8]}.mp3"
+        )
+
+        try:
+
+            print(
+                f"[SHAZAM] {index}/{len(segments)} "
+                f"→ {start_time}s dan tekshirilmoqda..."
             )
-        data = resp.json()
-        if data.get("status") == "success" and data.get("result"):
-            r = data["result"]
+
+            # -------------------------------------------------
+            # AUDIO AJRATISH
+            # -------------------------------------------------
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+
+                    "-ss", str(start_time),
+                    "-i", filepath,
+
+                    "-vn",
+
+                    # Shazam uchun yaxshi format
+                    "-ac", "2",
+                    "-ar", "44100",
+
+                    "-acodec", "libmp3lame",
+                    "-b:a", "192k",
+
+                    # 20 sekundlik parcha
+                    "-t", "20",
+
+                    audio_path
+                ],
+                check=True,
+                capture_output=True,
+                timeout=60
+            )
+
+            # Fayl yaratilganini tekshirish
+            if not os.path.exists(audio_path):
+                print(
+                    "[SHAZAM] Audio fayl yaratilmagan."
+                )
+                continue
+
+            # Juda kichik fayl bo'lsa o'tkazib yuboramiz
+            if os.path.getsize(audio_path) < 5000:
+                print(
+                    "[SHAZAM] Audio fayl juda kichik."
+                )
+                continue
+
+            # -------------------------------------------------
+            # SHAZAMGA YUBORISH
+            # -------------------------------------------------
+
+            result = await shazam.recognize(audio_path)
+
+            print(
+                f"[SHAZAM] Natija: {result}"
+            )
+
+            if not result:
+                print(
+                    "[SHAZAM] Bu segmentda musiqa topilmadi."
+                )
+                continue
+
+            if "track" not in result:
+                print(
+                    "[SHAZAM] Track topilmadi."
+                )
+                continue
+
+            track = result["track"]
+
+            title = (
+                track.get("title") or ""
+            ).strip()
+
+            artist = (
+                track.get("subtitle") or ""
+            ).strip()
+
+            if not title:
+                continue
+
+            if not artist:
+                artist = "Noma'lum"
+
+            print(
+                f"[SHAZAM] ✅ MUSIQA TOPILDI:"
+                f" {artist} - {title}"
+            )
+
             return {
-                "title": r.get("title"),
-                "artist": r.get("artist"),
-                "source": "audd"
+                "title": title,
+                "artist": artist,
+                "url": track.get("url", ""),
+                "image": (
+                    track.get("images", {}).get("coverarthq")
+                    or track.get("images", {}).get("coverart")
+                    or ""
+                ),
+                "source": "shazam"
             }
-    except Exception as e:
-        logging.warning(f"AudD xatosi: {e}")
-    finally:
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
+
+        except Exception as e:
+
+            logging.warning(
+                f"[SHAZAM] {start_time}s segment xatosi: {e}"
+            )
+
+            # Bitta segment xato bersa,
+            # keyingisini tekshirishda davom etamiz.
+            continue
+
+        finally:
+
+            # Vaqtinchalik MP3 ni o'chirish
+            if os.path.exists(audio_path):
+
+                try:
+                    os.remove(audio_path)
+
+                except Exception as e:
+                    logging.warning(
+                        f"[SHAZAM] Vaqtinchalik fayl "
+                        f"o'chirilmadi: {e}"
+                    )
+
+    # ---------------------------------------------------------
+    # HECH QAYSI SEGMENTDA TOPILMADI
+    # ---------------------------------------------------------
+
+    print(
+        "[SHAZAM] ❌ Hech qaysi segmentdan "
+        "musiqa aniqlanmadi."
+    )
+
     return None
 
 
+def recognize_with_audd(filepath: str) -> dict | None:
+    """AudD orqali musiqani aniqlash — Shazam uchun zaxira."""
+
+    if not AUDD_API_TOKEN:
+        print("[AUDD] ❌ AUDD_API_TOKEN mavjud emas!")
+        return None
+
+    if not os.path.exists(filepath):
+        print(f"[AUDD] ❌ Fayl topilmadi: {filepath}")
+        return None
+
+    audio_path = os.path.join(
+        DOWNLOAD_DIR,
+        f"audd_{uuid.uuid4().hex[:8]}.mp3"
+    )
+
+    try:
+
+        print("[AUDD] 🎵 Audio tayyorlanmoqda...")
+
+        # -----------------------------------------------------
+        # Videodan sifatli audio ajratamiz
+        # -----------------------------------------------------
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+
+                "-i", filepath,
+
+                "-vn",
+
+                "-ac", "2",
+                "-ar", "44100",
+
+                "-acodec", "libmp3lame",
+                "-b:a", "192k",
+
+                # AudD uchun 20 sekund yetarli
+                "-t", "20",
+
+                audio_path
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60
+        )
+
+        if not os.path.exists(audio_path):
+            print("[AUDD] ❌ Audio fayl yaratilmadi.")
+            return None
+
+        size = os.path.getsize(audio_path)
+
+        print(
+            f"[AUDD] Audio tayyor: "
+            f"{round(size / 1024, 1)} KB"
+        )
+
+        if size < 5000:
+            print("[AUDD] ❌ Audio fayl juda kichik.")
+            return None
+
+        # -----------------------------------------------------
+        # AudD API
+        # -----------------------------------------------------
+
+        print("[AUDD] 🔍 AudD orqali musiqa qidirilmoqda...")
+
+        with open(audio_path, "rb") as f:
+
+            resp = requests.post(
+                "https://api.audd.io/",
+                data={
+                    "api_token": AUDD_API_TOKEN,
+                    "return": "apple_music,spotify"
+                },
+                files={
+                    "file": (
+                        "audio.mp3",
+                        f,
+                        "audio/mpeg"
+                    )
+                },
+                timeout=60
+            )
+
+        print(
+            f"[AUDD] HTTP status: {resp.status_code}"
+        )
+
+        # -----------------------------------------------------
+        # JSON javob
+        # -----------------------------------------------------
+
+        try:
+            data = resp.json()
+        except Exception:
+
+            print(
+                "[AUDD] ❌ API JSON qaytarmadi:"
+            )
+
+            print(
+                resp.text[:1000]
+            )
+
+            return None
+
+        print(
+            f"[AUDD] API javobi: {data}"
+        )
+
+        # -----------------------------------------------------
+        # SUCCESS
+        # -----------------------------------------------------
+
+        if (
+            data.get("status") == "success"
+            and data.get("result")
+        ):
+
+            result = data["result"]
+
+            title = (
+                result.get("title")
+                or ""
+            ).strip()
+
+            artist = (
+                result.get("artist")
+                or ""
+            ).strip()
+
+            if not title:
+                print(
+                    "[AUDD] ❌ Natija bor, "
+                    "lekin title yo'q."
+                )
+                return None
+
+            if not artist:
+                artist = "Noma'lum"
+
+            print(
+                f"[AUDD] ✅ MUSIQA TOPILDI: "
+                f"{artist} - {title}"
+            )
+
+            return {
+                "title": title,
+                "artist": artist,
+                "source": "audd",
+
+                # Qo'shimcha ma'lumotlar
+                "url": result.get("song_link", ""),
+                "image": "",
+            }
+
+        # -----------------------------------------------------
+        # MUSIQA TOPILMADI
+        # -----------------------------------------------------
+
+        if data.get("status") == "success":
+
+            print(
+                "[AUDD] ❌ AudD ham musiqani aniqlay olmadi."
+            )
+
+        else:
+
+            print(
+                "[AUDD] ❌ AudD API xatosi:"
+            )
+
+            print(
+                data.get("error")
+                or data
+            )
+
+        return None
+
+    except requests.exceptions.Timeout:
+
+        print(
+            "[AUDD] ❌ API timeout."
+        )
+
+        return None
+
+    except requests.exceptions.RequestException as e:
+
+        print(
+            f"[AUDD] ❌ Internet/API xatosi: {e}"
+        )
+
+        return None
+
+    except Exception as e:
+
+        logging.exception(
+            f"[AUDD] Kutilmagan xato: {e}"
+        )
+
+        return None
+
+    finally:
+
+        if os.path.exists(audio_path):
+
+            try:
+                os.remove(audio_path)
+
+            except Exception:
+                pass
+
+
 async def recognize_music(filepath: str) -> dict | None:
-    """Avval Shazam, ishlamasa AudD"""
-    result = await recognize_with_shazam(filepath)
-    if result:
-        return result
-    return await asyncio.to_thread(recognize_with_audd, filepath)
+    """
+    Musiqani aniqlash:
+    1. Shazam
+    2. Shazam topmasa AudD
+    """
+
+    print("=" * 60)
+    print("[MUSIC] 🎵 Musiqani aniqlash boshlandi")
+
+    # ---------------------------------------------------------
+    # 1. SHAZAM
+    # ---------------------------------------------------------
+
+    print("[MUSIC] 1️⃣ Shazam tekshirilmoqda...")
+
+    try:
+
+        result = await recognize_with_shazam(filepath)
+
+        if result:
+
+            print(
+                f"[MUSIC] ✅ Shazam topdi: "
+                f"{result.get('artist')} - "
+                f"{result.get('title')}"
+            )
+
+            return result
+
+        print(
+            "[MUSIC] ❌ Shazam topmadi."
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            f"[MUSIC] Shazam xatosi: {e}"
+        )
+
+    # ---------------------------------------------------------
+    # 2. AUDD
+    # ---------------------------------------------------------
+
+    print(
+        "[MUSIC] 2️⃣ Shazam topmadi → AudD ishga tushmoqda..."
+    )
+
+    try:
+
+        result = await asyncio.to_thread(
+            recognize_with_audd,
+            filepath
+        )
+
+        if result:
+
+            print(
+                f"[MUSIC] ✅ AudD topdi: "
+                f"{result.get('artist')} - "
+                f"{result.get('title')}"
+            )
+
+            return result
+
+        print(
+            "[MUSIC] ❌ AudD ham topmadi."
+        )
+
+    except Exception as e:
+
+        logging.exception(
+            f"[MUSIC] AudD xatosi: {e}"
+        )
+
+    # ---------------------------------------------------------
+    # HECH QAYSI SERVIS TOPMADI
+    # ---------------------------------------------------------
+
+    print(
+        "[MUSIC] ❌ Shazam ham, AudD ham "
+        "musiqani aniqlay olmadi."
+    )
+
+    print("=" * 60)
+
+    return None
+
 
 
 def upload_large_file(filepath: str) -> str:
@@ -628,163 +1090,482 @@ async def on_ig_video(callback: CallbackQuery):
         except Exception:
             await status.edit_text(f"❌ Xatolik: {err_text}")
 
-
 @dp.callback_query(F.data.startswith("ig_audio:"))
 async def on_ig_audio(callback: CallbackQuery):
     await callback.answer()
-    link_id = callback.data.split(":")[1]
+
+    link_id = callback.data.split(":", 1)[1]
     url_data = user_links.get(link_id)
 
     if not url_data:
-        await callback.message.answer("Jonim bolam eski linkni ustiga bosma qaytadan yubor linkni 😁")
+        await callback.message.answer(
+            "❌ Bu link eskirgan.\n\n"
+            "Iltimos, Instagram linkini qaytadan yuboring."
+        )
         return
 
     url = url_data["url"]
-    status = await callback.message.answer("⏳ Musiqa qidirilmoqda...")
-    print(f"[INFO] Instagram AUDIO jarayoni boshlandi: {url}")
+
+    status = await callback.message.answer(
+        "⏳ <b>Instagram videosi yuklanmoqda...</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+    filepath = None
+    filename = None
 
     try:
-        # 1. Videoni yuklab olamiz (audio uchun)
-        result = await asyncio.to_thread(download_media, url, height=None, is_audio=False)
+        print("=" * 60)
+        print(f"[INFO] Instagram AUDIO boshlandi")
+        print(f"[INFO] URL: {url}")
+
+        # =========================================================
+        # 1. INSTAGRAM VIDEOSINI YUKLAB OLISH
+        # =========================================================
+
+        result = await asyncio.to_thread(
+            download_media,
+            url,
+            height=None,
+            is_audio=False
+        )
+
         filepath = result["filename"]
-        print(f"[INFO] Vaqtinchalik video yuklandi: {filepath}")
 
-        # 2. Shazam / AudD bilan aniqlash
-        await status.edit_text("🎵 Musiqa qidirilmoqda...")
+        print(f"[INFO] Video yuklandi: {filepath}")
+
+        if not os.path.exists(filepath):
+            raise Exception("Instagram videosi yuklab olinmadi.")
+
+        # =========================================================
+        # 2. SHAZAM / AUDD ORQALI MUSIQANI ANIQLASH
+        # =========================================================
+
+        await status.edit_text(
+            "🎵 <b>Videodagi musiqa aniqlanmoqda...</b>",
+            parse_mode=ParseMode.HTML
+        )
+
         music = await recognize_music(filepath)
-        print(f"Natija: {music}")
 
+        print(f"[INFO] Shazam/AudD natijasi: {music}")
+
+        # Agar Shazam topmasa, Instagram metadata
         if not music:
-            # Agar Shazam topmasa, Instagram metadata dan olishga harakat
             music = url_data.get("music_info")
-            print(f"[INFO] Metadata dan olingan: {music}")
+            print(f"[INFO] Instagram metadata natijasi: {music}")
+
+        # =========================================================
+        # 3. MUSIQA TOPILMAGAN BO'LSA
+        # =========================================================
 
         if not music or not music.get("title"):
-            await status.edit_text("❌ Videoni qayerdan oldinge musiqasini topib bo'lmaydiku 🤔.")
-            if os.path.exists(filepath):
+            await status.edit_text(
+                "❌ <b>Musiqani aniqlab bo'lmadi.</b>\n\n"
+                "Videoda musiqa juda qisqa yoki Shazam uni taniy olmadi.",
+                parse_mode=ParseMode.HTML
+            )
+
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
+
             return
 
-        query = f"{music.get('artist', '')} - {music.get('title', '')}".strip(" -")
-        print(f"[INFO] To‘liq qo‘shiq qidirilmoqda: «{query}»")
+        artist = (music.get("artist") or "").strip()
+        title = (music.get("title") or "").strip()
 
-        await status.edit_text(f"🔍 «{query}»")
+        # Artist + title
+        if artist and artist.lower() not in ["unknown", "noma'lum"]:
+            query = f"{artist} - {title}"
+        else:
+            query = title
 
-                # 3. YouTube dan to‘liq qo‘shiqni yuklash
-                # 3. YouTube dan to‘liq qo‘shiqni yuklash
-        unique_id = uuid.uuid4().hex[:8]
+        print(f"[INFO] Aniqlangan musiqa: {query}")
 
-        # Query’ni tozalash (maxsus belgilar muammo qiladi)
-        clean_query = query.replace("'", "").replace('"', "").replace("&", "and").strip()
-        # juda uzun bo‘lsa qisqartiramiz
-        if len(clean_query) > 80:
-            parts = clean_query.split(" - ")
-            if len(parts) >= 2:
-                clean_query = f"{parts[0][:40]} - {parts[1][:40]}"
-            else:
-                clean_query = clean_query[:80]
+        # =========================================================
+        # 4. QUERY NI TOZALASH
+        # =========================================================
+
+        import re
+
+        clean_query = query
+
+        # HTML / maxsus belgilarni olib tashlash
+        clean_query = re.sub(r"<[^>]+>", "", clean_query)
+
+        # Keraksiz belgilarni bo'sh joyga almashtirish
+        clean_query = re.sub(
+            r"[\"'`|\\/\[\]\{\}\(\)<>#@*_+=~^]",
+            " ",
+            clean_query
+        )
+
+        # Emoji va boshqa g'alati belgilarni saqlamaslik
+        clean_query = re.sub(
+            r"[^\w\s\-.,!?&]",
+            " ",
+            clean_query,
+            flags=re.UNICODE
+        )
+
+        # Ortiqcha bo'shliqlar
+        clean_query = re.sub(r"\s+", " ", clean_query).strip()
+
+        # Juda uzun query
+        if len(clean_query) > 100:
+            clean_query = clean_query[:100].strip()
+
+        if not clean_query:
+            raise Exception("Musiqa nomi bo'sh chiqdi.")
+
+        print(f"[INFO] Tozalangan YouTube query: {clean_query}")
+
+        await status.edit_text(
+            f"🔍 <b>{clean_query}</b>\n\n"
+            "YouTube'dan to'liq qo'shiq qidirilmoqda...",
+            parse_mode=ParseMode.HTML
+        )
+
+        # =========================================================
+        # 5. UNIQUE FOLDER / FILE NOMI
+        # =========================================================
+
+        unique_id = uuid.uuid4().hex[:12]
+
+        output_template = os.path.join(
+            DOWNLOAD_DIR,
+            f"{unique_id}_song.%(ext)s"
+        )
+
+        # =========================================================
+        # 6. YOUTUBE OPTIONS
+        # =========================================================
 
         opts = get_base_opts()
+
         opts.update({
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": f"{DOWNLOAD_DIR}/{unique_id}_song.%(ext)s",
+            "format": (
+                "bestaudio[ext=m4a]/"
+                "bestaudio[ext=webm]/"
+                "bestaudio[ext=opus]/"
+                "bestaudio/best"
+            ),
+
+            "outtmpl": output_template,
+
             "default_search": "ytsearch1",
+
             "noplaylist": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
+
+            "quiet": True,
+
+            "no_warnings": True,
+
+            "retries": 5,
+
+            "fragment_retries": 5,
+
+            "continuedl": True,
+
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
         })
 
-        print(f"[INFO] YouTube qidiruv: ytsearch1:{clean_query}")
+        # =========================================================
+        # 7. YOUTUBE DAN TO'LIQ QO'SHIQNI QIDIRISH
+        # =========================================================
+
+        print(
+            f"[INFO] YouTube qidiruv: "
+            f"ytsearch1:{clean_query}"
+        )
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(f"ytsearch1:{clean_query}", download=True)
 
-                if "entries" in info and info["entries"]:
-                    info = info["entries"][0]
-                elif not info:
-                    raise Exception("Qo‘shiq topilmadi")
+                search_result = ydl.extract_info(
+                    f"ytsearch1:{clean_query}",
+                    download=False
+                )
+
+                if not search_result:
+                    raise Exception(
+                        "YouTube'dan hech qanday natija topilmadi."
+                    )
+
+                entries = search_result.get("entries")
+
+                if not entries:
+                    raise Exception(
+                        f"YouTube'da «{clean_query}» topilmadi."
+                    )
+
+                video_info = entries[0]
+
+                if not video_info:
+                    raise Exception(
+                        "YouTube qidiruv natijasi bo'sh."
+                    )
+
+                print(
+                    f"[INFO] YouTube topildi: "
+                    f"{video_info.get('title')}"
+                )
+
+                # Endi aynan topilgan videoni yuklaymiz
+                info = ydl.extract_info(
+                    video_info["webpage_url"],
+                    download=True
+                )
 
         except Exception as e:
+
             err_msg = str(e)
-            print(f"[ERROR] YouTube qidiruv xatosi: {err_msg}")
 
-            if "Sign in to confirm you’re not a bot" in err_msg or "confirm you’re not a bot" in err_msg:
+            print(
+                f"[ERROR] YouTube yuklash xatosi: "
+                f"{err_msg}"
+            )
+
+            # YouTube bot tekshiruvi
+            if (
+                "Sign in to confirm" in err_msg
+                or "confirm you're not a bot" in err_msg
+                or "not a bot" in err_msg
+            ):
+
                 await status.edit_text(
-                    "❌ <b>YouTube cookies eskirgan yoki yaroqsiz</b>\n\n"
-                    "Serverda YouTube botni aniqlayapti.\n"
-                    "cookies.txt ni yangilab, botni qayta ishga tushiring.",
+                    "❌ <b>YouTube botni aniqladi.</b>\n\n"
+                    "cookies.txt faylingizni yangilash kerak.",
                     parse_mode=ParseMode.HTML
                 )
+
+            elif "Requested format is not available" in err_msg:
+
+                await status.edit_text(
+                    "❌ <b>Audio formati mavjud emas.</b>\n\n"
+                    "Boshqa YouTube natijasi bilan urinib ko'rish kerak.",
+                    parse_mode=ParseMode.HTML
+                )
+
             else:
+
+                safe_error = (
+                    err_msg
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+
                 await status.edit_text(
-                    f"❌ Qo‘shiqni yuklab bo‘lmadi:\n<code>{err_msg[:200]}</code>",
+                    f"❌ <b>Qo'shiqni yuklashda xato:</b>\n\n"
+                    f"<code>{safe_error[:800]}</code>",
                     parse_mode=ParseMode.HTML
                 )
 
-            if os.path.exists(filepath):
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
+
             return
 
-        # Faylni ishonchli topish
-        filename = None
-        possible = []
-        for f in os.listdir(DOWNLOAD_DIR):
-            if f.endswith(".mp3") and unique_id in f:
-                possible.append(os.path.join(DOWNLOAD_DIR, f))
+        # =========================================================
+        # 8. MP3 FAYLNI FAQAT SHU UNIQUE ID ORQALI TOPAMIZ
+        # =========================================================
 
-        if possible:
-            filename = max(possible, key=os.path.getmtime)
+        expected_mp3 = os.path.join(
+            DOWNLOAD_DIR,
+            f"{unique_id}_song.mp3"
+        )
+
+        # FFmpeg tugashini kutish
+        for _ in range(30):
+
+            if os.path.exists(expected_mp3):
+                break
+
+            await asyncio.sleep(0.5)
+
+        if os.path.exists(expected_mp3):
+
+            filename = expected_mp3
+
         else:
-            # fallback
-            all_mp3 = [
-                os.path.join(DOWNLOAD_DIR, f)
-                for f in os.listdir(DOWNLOAD_DIR)
-                if f.endswith(".mp3")
-            ]
-            if all_mp3:
-                filename = max(all_mp3, key=os.path.getmtime)
+
+            # Agar nom boshqacha chiqsa, faqat unique_id bo'yicha
+            # qidiramiz. Eski MP3 fayllarni olmaymiz.
+
+            candidates = []
+
+            for f in os.listdir(DOWNLOAD_DIR):
+
+                if (
+                    unique_id in f
+                    and f.lower().endswith(".mp3")
+                ):
+                    candidates.append(
+                        os.path.join(DOWNLOAD_DIR, f)
+                    )
+
+            if candidates:
+
+                filename = max(
+                    candidates,
+                    key=os.path.getmtime
+                )
+
+        # =========================================================
+        # 9. FAYL TOPILGANINI TEKSHIRISH
+        # =========================================================
 
         if not filename or not os.path.exists(filename):
-            await status.edit_text("❌ Qo‘shiq fayli topilmadi.")
-            if os.path.exists(filepath):
+
+            print(
+                "[ERROR] MP3 topilmadi."
+            )
+
+            print(
+                "[DEBUG] downloads papkasidagi fayllar:"
+            )
+
+            for f in os.listdir(DOWNLOAD_DIR):
+                print("   ", f)
+
+            await status.edit_text(
+                "❌ <b>Qo'shiq yuklandi, lekin MP3 fayl "
+                "topilmadi.</b>\n\n"
+                "FFmpeg ishlashida muammo bo'lishi mumkin.",
+                parse_mode=ParseMode.HTML
+            )
+
+            if filepath and os.path.exists(filepath):
                 os.remove(filepath)
+
             return
 
-        size_mb = round(os.path.getsize(filename) / (1024 * 1024), 1)
+        # =========================================================
+        # 10. FILE HAJMI
+        # =========================================================
+
+        file_size = os.path.getsize(filename)
+
+        if file_size <= 0:
+            raise Exception(
+                "MP3 fayl bo'sh."
+            )
+
+        size_mb = round(
+            file_size / (1024 * 1024),
+            1
+        )
+
+        print(
+            f"[SUCCESS] MP3 tayyor: "
+            f"{filename} ({size_mb} MB)"
+        )
+
+        # =========================================================
+        # 11. TELEGRAMGA AUDIO YUBORISH
+        # =========================================================
+
         file = FSInputFile(filename)
+
+        song_title = (
+            info.get("title")
+            or title
+            or clean_query
+        )
+
+        caption_artist = artist or "Noma'lum"
 
         await callback.message.answer_audio(
             audio=file,
-            title=info.get("title", clean_query),
+            title=song_title[:64],
+            performer=caption_artist[:64],
             caption=(
-                f"💎 <b>{info.get('title', clean_query)}</b>\n"
+                f"💎 <b>{song_title}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎤 {music.get('artist', 'Noma\'lum')} — {music.get('title', '')}\n"
+                f"🎤 {caption_artist}\n"
                 f"📦 MP3 • <b>{size_mb} MB</b>\n"
                 f"✨ Premium Audio"
             ),
             parse_mode=ParseMode.HTML
         )
-        print(f"Mana to'liq musiqang 😁 {info.get('title')}")
+
+        print(
+            f"[SUCCESS] To'liq musiqa yuborildi: "
+            f"{song_title}"
+        )
 
         await status.delete()
 
-        # Tozalash
-        for p in (filepath, filename):
-            if os.path.exists(p):
-                os.remove(p)
+        # =========================================================
+        # 12. VAQTINCHALIK FAYLLARNI O'CHIRISH
+        # =========================================================
+
+        for p in [filepath, filename]:
+
+            if p and os.path.exists(p):
+
+                try:
+                    os.remove(p)
+                    print(f"[CLEANUP] O'chirildi: {p}")
+
+                except Exception as e:
+
+                    print(
+                        f"[WARN] Faylni o'chirib bo'lmadi: "
+                        f"{e}"
+                    )
 
     except Exception as e:
+
         logging.exception(e)
-        print(f"[ERROR] ig_audio: {e}")
-        err_text = str(e).replace("<", "&lt;").replace(">", "&gt;")
-        await status.edit_text(f"❌ Xatolik:\n<code>{err_text}</code>", parse_mode=ParseMode.HTML)
+
+        print(
+            f"[ERROR] ig_audio: {e}"
+        )
+
+        err_text = str(e)
+
+        err_text = (
+            err_text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+        try:
+
+            await status.edit_text(
+                f"❌ <b>Xatolik yuz berdi:</b>\n\n"
+                f"<code>{err_text[:800]}</code>",
+                parse_mode=ParseMode.HTML
+            )
+
+        except Exception:
+
+            await callback.message.answer(
+                f"❌ Xatolik: {err_text[:800]}"
+            )
+
+        # =====================================================
+        # FINAL CLEANUP
+        # =====================================================
+
+        for p in [filepath, filename]:
+
+            if p and os.path.exists(p):
+
+                try:
+                    os.remove(p)
+
+                except Exception:
+                    pass
 
 
 @dp.callback_query(F.data.startswith("dl:"))
