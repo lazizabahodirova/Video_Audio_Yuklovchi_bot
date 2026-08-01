@@ -108,7 +108,6 @@ def get_video_info(url: str) -> dict:
                     elif len(parts) == 3:
                         duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
                 else:
-                    # faqat son bo'lsa
                     duration = int(float(dur_str))
             except (ValueError, TypeError):
                 pass
@@ -119,6 +118,21 @@ def get_video_info(url: str) -> dict:
             if entry and entry.get("duration") and entry["duration"] > 0:
                 duration = int(entry["duration"])
                 break
+
+    if duration <= 0:
+        # ba'zi Instagram videolarida "video_duration" yoki "length" bo'ladi
+        for key in ("video_duration", "length", "approx_duration_ms"):
+            val = info.get(key)
+            if val:
+                try:
+                    if key.endswith("_ms"):
+                        duration = int(float(val) / 1000)
+                    else:
+                        duration = int(float(val))
+                    if duration > 0:
+                        break
+                except (ValueError, TypeError):
+                    pass
 
     duration = int(duration) if duration else 0
 
@@ -365,7 +379,7 @@ def human_size(num: int) -> str:
     return f"{round(mb)}MB"
 
 
-def build_keyboard(link_id: str, size_map: dict, audio_size: int) -> InlineKeyboardMarkup:
+def build_keyboard(link_id: str, size_map: dict, audio_size: int, duration: int = 0) -> InlineKeyboardMarkup:
     buttons = []
     row = []
     for q in QUALITIES:
@@ -392,6 +406,17 @@ def build_keyboard(link_id: str, size_map: dict, audio_size: int) -> InlineKeybo
             callback_data=f"dl:{link_id}:mp3"
         )
     ])
+
+    # ===== YANGI: Shorts (1:10 dan kam) uchun to‘liq musiqa tugmasi =====
+    if 0 < duration < 70:          # 1:10 = 70 sekund
+        buttons.append([
+            InlineKeyboardButton(
+                text="🎧 To‘liq musiqani topish",
+                callback_data=f"findfull:{link_id}"
+            )
+        ])
+    # ===================================================================
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def build_instagram_keyboard(link_id: str) -> InlineKeyboardMarkup:
@@ -493,7 +518,7 @@ async def on_url(message: Message):
             return
 
         # ===== YouTube uchun eski sifat tanlash =====
-        kb = build_keyboard(link_id, info["size_map"], info["audio_size"])
+        kb = build_keyboard(link_id, info["size_map"], info["audio_size"], duration)
         text += "\nSifatni tanlang:"
         await status.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
@@ -645,12 +670,12 @@ async def on_ig_audio(callback: CallbackQuery):
 
         await status.edit_text(f"🔍 «{query}»")
 
-        # 3. YouTube dan to‘liq qo‘shiqni yuklash (mavjud on_full_song logikasi)
                 # 3. YouTube dan to‘liq qo‘shiqni yuklash
+        unique_id = uuid.uuid4().hex[:8]
         opts = get_base_opts()
         opts.update({
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s",
+            "outtmpl": f"{DOWNLOAD_DIR}/{unique_id}_song.%(ext)s",
             "default_search": "ytsearch1",
             "noplaylist": True,
             "postprocessors": [{
@@ -670,18 +695,23 @@ async def on_ig_audio(callback: CallbackQuery):
             elif not info:
                 raise Exception("Qo‘shiq topilmadi")
 
-            filename = ydl.prepare_filename(info)
-            mp3 = os.path.splitext(filename)[0] + ".mp3"
+        # Faylni ishonchli topish (eng yangi .mp3)
+        filename = None
+        possible = []
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.endswith(".mp3") and (unique_id in f or "song" in f):
+                possible.append(os.path.join(DOWNLOAD_DIR, f))
 
-            if os.path.exists(mp3):
-                filename = mp3
-            else:
-                for f in os.listdir(DOWNLOAD_DIR):
-                    if f.endswith(".mp3") and (info.get("id", "") in f or "song" in f):
-                        filename = os.path.join(DOWNLOAD_DIR, f)
-                        break
+        if possible:
+            # eng yangi faylni olamiz
+            filename = max(possible, key=os.path.getmtime)
+        else:
+            # fallback: DOWNLOAD_DIR dagi eng yangi mp3
+            all_mp3 = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".mp3")]
+            if all_mp3:
+                filename = max(all_mp3, key=os.path.getmtime)
 
-        if not os.path.exists(filename):
+        if not filename or not os.path.exists(filename):
             await status.edit_text("❌ Videoni qayerdan olgansan, musiqasini topib bo‘lmadi 😒")
             print("[ERROR] Qo‘shiq fayli topilmadi")
             if os.path.exists(filepath):
@@ -888,6 +918,103 @@ async def on_full_song(callback: CallbackQuery):
 
         if os.path.exists(filename):
             os.remove(filename)
+
+    except Exception as e:
+        logging.exception(e)
+        err_text = str(e).replace("<", "&lt;").replace(">", "&gt;")
+        await status.edit_text(f"❌ Xatolik:\n<code>{err_text}</code>", parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data.startswith("findfull:"))
+async def on_find_full_music(callback: CallbackQuery):
+    """YouTube Shorts uchun to‘liq musiqani topish"""
+    await callback.answer()
+    link_id = callback.data.split(":")[1]
+    url_data = user_links.get(link_id)
+
+    if not url_data:
+        await callback.message.answer("❌ Link eskirgan. Qaytadan yuboring.")
+        return
+
+    url = url_data["url"]
+    status = await callback.message.answer("⏳ Video yuklab olinmoqda va musiqa qidirilmoqda...")
+
+    try:
+        # 1. Videoni vaqtincha yuklab olamiz
+        result = await asyncio.to_thread(download_media, url, height=None, is_audio=False)
+        filepath = result["filename"]
+
+        # 2. Shazam / AudD
+        await status.edit_text("🎵 Musiqa aniqlanmoqda...")
+        music = await recognize_music(filepath)
+
+        if not music or not music.get("title"):
+            await status.edit_text("❌ Musiqani topib bo‘lmadi 😕")
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            return
+
+        query = f"{music.get('artist', '')} - {music.get('title', '')}".strip(" -")
+        await status.edit_text(f"🔍 «{query}» qidirilmoqda...")
+
+        # 3. YouTube dan to‘liq qo‘shiqni yuklash
+        opts = get_base_opts()
+        opts.update({
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s",
+            "default_search": "ytsearch1",
+            "noplaylist": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        })
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            elif not info:
+                raise Exception("Qo‘shiq topilmadi")
+
+            filename = ydl.prepare_filename(info)
+            mp3 = os.path.splitext(filename)[0] + ".mp3"
+            if os.path.exists(mp3):
+                filename = mp3
+            else:
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if f.endswith(".mp3") and (info.get("id", "") in f or "song" in f):
+                        filename = os.path.join(DOWNLOAD_DIR, f)
+                        break
+
+        if not os.path.exists(filename):
+            await status.edit_text("❌ To‘liq qo‘shiq topilmadi.")
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            return
+
+        size_mb = round(os.path.getsize(filename) / (1024 * 1024), 1)
+        file = FSInputFile(filename)
+
+        await callback.message.answer_audio(
+            audio=file,
+            title=info.get("title", query),
+            caption=(
+                f"💎 <b>{info.get('title', query)}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎤 {music.get('artist', 'Noma\'lum')} — {music.get('title', '')}\n"
+                f"📦 MP3 • <b>{size_mb} MB</b>\n"
+                f"✨ Premium Audio"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        await status.delete()
+
+        # Tozalash
+        for p in (filepath, filename):
+            if os.path.exists(p):
+                os.remove(p)
 
     except Exception as e:
         logging.exception(e)
