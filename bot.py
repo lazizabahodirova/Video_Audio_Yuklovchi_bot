@@ -671,13 +671,27 @@ async def on_ig_audio(callback: CallbackQuery):
         await status.edit_text(f"🔍 «{query}»")
 
                 # 3. YouTube dan to‘liq qo‘shiqni yuklash
+                # 3. YouTube dan to‘liq qo‘shiqni yuklash
         unique_id = uuid.uuid4().hex[:8]
+
+        # Query’ni tozalash (maxsus belgilar muammo qiladi)
+        clean_query = query.replace("'", "").replace('"', "").replace("&", "and").strip()
+        # juda uzun bo‘lsa qisqartiramiz
+        if len(clean_query) > 80:
+            parts = clean_query.split(" - ")
+            if len(parts) >= 2:
+                clean_query = f"{parts[0][:40]} - {parts[1][:40]}"
+            else:
+                clean_query = clean_query[:80]
+
         opts = get_base_opts()
         opts.update({
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": f"{DOWNLOAD_DIR}/{unique_id}_song.%(ext)s",
             "default_search": "ytsearch1",
             "noplaylist": True,
+            "retries": 3,
+            "fragment_retries": 3,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -685,35 +699,59 @@ async def on_ig_audio(callback: CallbackQuery):
             }],
         })
 
-        print(f"[INFO] YouTube qidiruv: ytsearch1:{query}")
+        print(f"[INFO] YouTube qidiruv: ytsearch1:{clean_query}")
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(f"ytsearch1:{clean_query}", download=True)
 
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            elif not info:
-                raise Exception("Qo‘shiq topilmadi")
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                elif not info:
+                    raise Exception("Qo‘shiq topilmadi")
 
-        # Faylni ishonchli topish (eng yangi .mp3)
+        except Exception as e:
+            err_msg = str(e)
+            print(f"[ERROR] YouTube qidiruv xatosi: {err_msg}")
+
+            if "Sign in to confirm you’re not a bot" in err_msg or "confirm you’re not a bot" in err_msg:
+                await status.edit_text(
+                    "❌ <b>YouTube cookies eskirgan yoki yaroqsiz</b>\n\n"
+                    "Serverda YouTube botni aniqlayapti.\n"
+                    "cookies.txt ni yangilab, botni qayta ishga tushiring.",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await status.edit_text(
+                    f"❌ Qo‘shiqni yuklab bo‘lmadi:\n<code>{err_msg[:200]}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            return
+
+        # Faylni ishonchli topish
         filename = None
         possible = []
         for f in os.listdir(DOWNLOAD_DIR):
-            if f.endswith(".mp3") and (unique_id in f or "song" in f):
+            if f.endswith(".mp3") and unique_id in f:
                 possible.append(os.path.join(DOWNLOAD_DIR, f))
 
         if possible:
-            # eng yangi faylni olamiz
             filename = max(possible, key=os.path.getmtime)
         else:
-            # fallback: DOWNLOAD_DIR dagi eng yangi mp3
-            all_mp3 = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".mp3")]
+            # fallback
+            all_mp3 = [
+                os.path.join(DOWNLOAD_DIR, f)
+                for f in os.listdir(DOWNLOAD_DIR)
+                if f.endswith(".mp3")
+            ]
             if all_mp3:
                 filename = max(all_mp3, key=os.path.getmtime)
 
         if not filename or not os.path.exists(filename):
-            await status.edit_text("❌ Videoni qayerdan olgansan, musiqasini topib bo‘lmadi 😒")
-            print("[ERROR] Qo‘shiq fayli topilmadi")
+            await status.edit_text("❌ Qo‘shiq fayli topilmadi.")
             if os.path.exists(filepath):
                 os.remove(filepath)
             return
@@ -723,9 +761,9 @@ async def on_ig_audio(callback: CallbackQuery):
 
         await callback.message.answer_audio(
             audio=file,
-            title=info.get("title", query),
+            title=info.get("title", clean_query),
             caption=(
-                f"💎 <b>{info.get('title', query)}</b>\n"
+                f"💎 <b>{info.get('title', clean_query)}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎤 {music.get('artist', 'Noma\'lum')} — {music.get('title', '')}\n"
                 f"📦 MP3 • <b>{size_mb} MB</b>\n"
