@@ -1757,8 +1757,11 @@ async def on_find_full_music(callback: CallbackQuery):
     url = url_data["url"]
     status = await callback.message.answer("⏳ Video yuklab olinmoqda va musiqa qidirilmoqda...")
 
+    filepath = None
+    filename = None
+
     try:
-        # 1. Videoni vaqtincha yuklab olamiz
+        # 1. Videoni yuklab olamiz
         result = await asyncio.to_thread(download_media, url, height=None, is_audio=False)
         filepath = result["filename"]
 
@@ -1766,22 +1769,44 @@ async def on_find_full_music(callback: CallbackQuery):
         await status.edit_text("🎵 Musiqa aniqlanmoqda...")
         music = await recognize_music(filepath)
 
+        # Metadata dan ham urinib ko‘ramiz
+        if not music:
+            music = url_data.get("music_info")
+
         if not music or not music.get("title"):
-            await status.edit_text("❌ Musiqani topib bo‘lmadi 😕")
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            # Ikkala servis ham topmadi — foydali javob
+            yt_search = "https://www.youtube.com/results?search_query=music"
+            buttons = [
+                [InlineKeyboardButton(text="🔍 YouTube’da qidirish", url=yt_search)]
+            ]
+
+            await status.edit_text(
+                "❌ <b>Musiqani aniqlab bo‘lmadi.</b>\n\n"
+                "Sabablari:\n"
+                "• Musiqa slowed / remixed bo‘lishi mumkin\n"
+                "• Ovoz juda past yoki qisqa\n"
+                "• AudD tokeni yaroqsiz (tekshiring)\n\n"
+                "Qo‘lda qidirib ko‘ring:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                parse_mode=ParseMode.HTML
+            )
             return
 
-        query = f"{music.get('artist', '')} - {music.get('title', '')}".strip(" -")
+        artist = (music.get("artist") or "").strip()
+        title = (music.get("title") or "").strip()
+        query = f"{artist} - {title}".strip(" -") if artist else title
+
         await status.edit_text(f"🔍 «{query}» qidirilmoqda...")
 
-        # 3. YouTube dan to‘liq qo‘shiqni yuklash
+        # 3. YouTube dan yuklash
+        unique_id = uuid.uuid4().hex[:10]
         opts = get_base_opts()
         opts.update({
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "outtmpl": f"{DOWNLOAD_DIR}/%(id)s_song.%(ext)s",
+            "outtmpl": f"{DOWNLOAD_DIR}/{unique_id}_song.%(ext)s",
             "default_search": "ytsearch1",
             "noplaylist": True,
+            "retries": 3,
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -1796,20 +1821,21 @@ async def on_find_full_music(callback: CallbackQuery):
             elif not info:
                 raise Exception("Qo‘shiq topilmadi")
 
-            filename = ydl.prepare_filename(info)
-            mp3 = os.path.splitext(filename)[0] + ".mp3"
-            if os.path.exists(mp3):
-                filename = mp3
-            else:
-                for f in os.listdir(DOWNLOAD_DIR):
-                    if f.endswith(".mp3") and (info.get("id", "") in f or "song" in f):
-                        filename = os.path.join(DOWNLOAD_DIR, f)
-                        break
+        # Faylni topish
+        filename = None
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.endswith(".mp3") and unique_id in f:
+                filename = os.path.join(DOWNLOAD_DIR, f)
+                break
 
-        if not os.path.exists(filename):
+        if not filename or not os.path.exists(filename):
+            # Fallback
+            all_mp3 = [os.path.join(DOWNLOAD_DIR, f) for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".mp3")]
+            if all_mp3:
+                filename = max(all_mp3, key=os.path.getmtime)
+
+        if not filename or not os.path.exists(filename):
             await status.edit_text("❌ To‘liq qo‘shiq topilmadi.")
-            if os.path.exists(filepath):
-                os.remove(filepath)
             return
 
         size_mb = round(os.path.getsize(filename) / (1024 * 1024), 1)
@@ -1817,11 +1843,12 @@ async def on_find_full_music(callback: CallbackQuery):
 
         await callback.message.answer_audio(
             audio=file,
-            title=info.get("title", query),
+            title=info.get("title", query)[:64],
+            performer=(artist or "Noma'lum")[:64],
             caption=(
                 f"💎 <b>{info.get('title', query)}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎤 {music.get('artist', 'Noma\'lum')} — {music.get('title', '')}\n"
+                f"🎤 {artist or 'Noma\'lum'} — {title}\n"
                 f"📦 MP3 • <b>{size_mb} MB</b>\n"
                 f"✨ Premium Audio"
             ),
@@ -1830,15 +1857,18 @@ async def on_find_full_music(callback: CallbackQuery):
 
         await status.delete()
 
-        # Tozalash
-        for p in (filepath, filename):
-            if os.path.exists(p):
-                os.remove(p)
-
     except Exception as e:
         logging.exception(e)
         err_text = str(e).replace("<", "&lt;").replace(">", "&gt;")
-        await status.edit_text(f"❌ Xatolik:\n<code>{err_text}</code>", parse_mode=ParseMode.HTML)
+        await status.edit_text(f"❌ Xatolik:\n<code>{err_text[:500]}</code>", parse_mode=ParseMode.HTML)
+
+    finally:
+        for p in (filepath, filename):
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except:
+                    pass
 
 
 async def main():
